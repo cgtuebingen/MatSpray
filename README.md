@@ -8,8 +8,10 @@
 
 ⚠️ This is work in progress please don't publish yet (will release Mon. 22 / 00:00 GMT)
 
-TODO: ADD TRAILER HERE
-<img width="4096" height="1654" alt="teaser" src="https://github.com/user-attachments/assets/27351b93-e045-4e98-91cc-1f49efe306f2" />
+<video width="100%" controls>
+  <source src="videos/trailer.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 
 <p align="center">
     <span> 🌐  <a href="https://matspray.jdihlmann.com/"> Project Page </a> </span>&nbsp;&nbsp;&nbsp;
