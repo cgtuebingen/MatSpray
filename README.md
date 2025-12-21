@@ -9,7 +9,7 @@
 ⚠️ This is work in progress please don't publish yet (will release Mon. 22 / 00:00 GMT)
 
 <video width="100%" controls autoplay muted loop>
-  <source src="videos/trailer.mp4" type="video/mp4">
+  <source src="https://github.com/user-attachments/assets/0ff4195d-a5dc-4d4f-9ff7-9ea093a46754" type="video/mp4">
 </video>
 
 *If the video doesn't load, [click here to view it directly](videos/trailer.mp4)*
