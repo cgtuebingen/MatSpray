@@ -8,11 +8,7 @@
 
 ⚠️ This is work in progress please don't publish yet (will release Mon. 22 / 00:00 GMT)
 
-<video width="100%" controls autoplay muted loop>
-  <source src="https://github.com/user-attachments/assets/0ff4195d-a5dc-4d4f-9ff7-9ea093a46754" type="video/mp4">
-</video>
-
-*If the video doesn't load, [click here to view it directly](videos/trailer.mp4)*
+https://github.com/user-attachments/assets/95c2114e-e33a-46ed-933a-3a2ec153f6ca
 
 <p align="center">
     <span> 🌐  <a href="https://matspray.jdihlmann.com/"> Project Page </a> </span>&nbsp;&nbsp;&nbsp;
