@@ -6,8 +6,6 @@
   </strong>
 </p>
 
-⚠️ This is work in progress please don't publish yet (will release Mon. 22 / 00:00 GMT)
-
 https://github.com/user-attachments/assets/95c2114e-e33a-46ed-933a-3a2ec153f6ca
 
 <p align="center">
