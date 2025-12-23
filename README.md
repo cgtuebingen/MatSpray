@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/95c2114e-e33a-46ed-933a-3a2ec153f6ca
 
 <p align="center">
     <span> 🌐  <a href="https://matspray.jdihlmann.com/"> Project Page </a> </span>&nbsp;&nbsp;&nbsp;
-    <span> 📄  <a href="http://arxiv.org/abs/"> Paper (Arxiv) </a> </span>&nbsp;&nbsp;&nbsp;
+    <span> 📄  <a href="https://arxiv.org/abs/2512.18314"> Paper (Arxiv) </a> </span>&nbsp;&nbsp;&nbsp;
   <span>  📦  <a href="https://drive.google.com/drive/folders/1znN_KllBKllIY_1PLZUHbnfHsB6KNifR?usp=sharing"> Materials </a> </span>&nbsp;&nbsp;&nbsp;
   <span>  ✍🏻
      <a href="https://github.com/cgtuebingen/MatSpray?tab=readme-ov-file#citation"> Citation </a> </span>&nbsp;&nbsp;&nbsp;
@@ -22,11 +22,11 @@ We propose MatSpray, a framework for fusing 2D material world knowledge from dif
 
 # Code
 
-Paper is currently under review, we will release the code shortly in a cleaned version. Up until then if you have any questions regarding the project or need material to compare against fast, feel free to contact us.
+Paper is currently under review, we will release the code shortly in a cleaned version, star the repo to not miss the release. Up until then if you have any questions regarding the project or need material to compare against fast, feel free to contact us.
 
 # Citation
 
-You can find our paper on [arXiv](https://arxiv.org/), please consider citing, if you find this work useful:
+You can find our paper on [arXiv](https://arxiv.org/abs/2512.18314), please consider citing, if you find this work useful:
 
 ```
 @inproceedings{langsteiner2025matspray,
