@@ -1,0 +1,16 @@
+dearpygui==1.10.1
+imageio==2.31.2
+matplotlib==3.5.2
+numpy==1.21.5
+opencv-python==4.1.0.25
+pillow==9.5.0
+plyfile==0.9
+scipy==1.7.3
+tensorboard==2.10.0
+tqdm==4.64.1
+kornia==0.6.12
+torch_scatter
+OpenEXR
+pyexr
+scikit-image
+lpips

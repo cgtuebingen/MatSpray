@@ -1,0 +1,11 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.verbose = true
+logging.level = "INFO"
+
+[project]
+name = "SampleRenderer"
+version = "0.0.1"

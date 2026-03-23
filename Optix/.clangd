@@ -1,0 +1,11 @@
+# NOTE: Update the paths below to match your local environment.
+CompileFlags:
+    Add:
+        - --std=gnu++17
+        - -I../Optix/common/3rdParty
+        - -I../Optix/common/3rdParty/glfw/include
+        - -I/path/to/optix/include
+        - -I/path/to/nanobind/include
+        - -I/path/to/python/include
+        - -I/path/to/torch/include
+        - -I/path/to/torch/include/torch/csrc/api/include

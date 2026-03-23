@@ -1,0 +1,523 @@
+diff --git a/configs/rgbx_inference.yaml b/configs/rgbx_inference.yaml
+index 80a8d3a..4837438 100644
+--- a/configs/rgbx_inference.yaml
++++ b/configs/rgbx_inference.yaml
+@@ -13,6 +13,9 @@ inference_min_guidance_scale: 1.0
+ inference_max_guidance_scale: 1.0
+ #inference_n_repeat: 1
+ 
++# sRGB to linear transformation flag
++srgb_to_linear: false
++
+ model_dtype: fp16
+ decode_chunk_size: 8
+ cond_mode: 'skip' # clip branch for cross attention
+@@ -37,3 +40,9 @@ autocast: true
+ use_deterministic_mode: false
+ 
+ subsample_every_n_frames: 1
++
++# Environment orientation controls
++# env_rot: yaw in degrees around Y
++# env_pitch: vertical tilt in degrees (around Z). Set to 90 to move light from right to top
++env_rot: 180.0
++env_pitch: 0.0
+diff --git a/inference_svd_xrgb.py b/inference_svd_xrgb.py
+index 98674be..d1d5cd0 100644
+--- a/inference_svd_xrgb.py
++++ b/inference_svd_xrgb.py
+@@ -9,6 +9,7 @@
+ import glob
+ import os
+ import json
++import re
+ from contextlib import nullcontext
+ import numpy as np
+ from PIL import Image
+@@ -47,6 +48,37 @@ from utils.utils_rgbx_inference import touch, find_images_recursive, base_plus_e
+ from utils.utils_env_proj import process_environment_map
+ from src.data.rendering_utils import envmap_vec
+ 
++def render_environment_background(env_ldr_tensor, target_size=None):
++    """
++    Render the environment map as a full 360° background from camera perspective.
++    
++    Args:
++        env_ldr_tensor: Tensor [H, W, 3] with environment map in camera view
++        target_size: Optional tuple (width, height) to resize to
++    
++    Returns:
++        PIL Image of the environment background
++    """
++    # Convert environment tensor to numpy and ensure it's in [0,1] range
++    env_array = env_ldr_tensor.cpu().numpy()
++    if env_array.max() <= 1.0:
++        env_array = env_array  # Already in [0,1]
++    else:
++        env_array = env_array / 255.0  # Convert from [0,255] to [0,1]
++    
++    # Resize if needed
++    if target_size and env_array.shape[:2] != (target_size[1], target_size[0]):
++        from PIL import Image as PILImage
++        env_pil = PILImage.fromarray((env_array * 255).astype(np.uint8))
++        env_pil = env_pil.resize(target_size, PILImage.LANCZOS)
++        env_array = np.array(env_pil).astype(np.float32) / 255.0
++    
++    # Convert back to PIL Image
++    env_uint8 = (env_array * 255).astype(np.uint8)
++    return Image.fromarray(env_uint8)
++
++
++
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument('--config', type=str, required=True)
+@@ -146,22 +178,76 @@ def main():
+         else:
+             image_extensions = list(cfg.image_extensions)
+ 
+-    validation_image_paths = find_images_recursive(cfg.inference_input_dir, image_extensions=image_extensions)
+-    validation_video_list = group_images_into_videos(validation_image_paths, image_group_mode=image_group_mode,
+-                                                     subsample_every_n_frames=subsample_every_n_frames)
++    # Create a list for each number (0-99)
++    validation_video_list = []
++    # Auto-discover frames from either rgb/ (r_<n>_rgb.png) or render/ (r_<n>.png)
++    discovered_numbers = []
++    rgb_dir_candidate = os.path.join(cfg.inference_input_dir, "rgb")
++    render_dir_candidate = os.path.join(cfg.inference_input_dir, "render")
++    use_render_dir = False
++
++    if os.path.isdir(rgb_dir_candidate):
++        for fname in os.listdir(rgb_dir_candidate):
++            m = re.match(r"^r_(\d+)_rgb\.png$", fname)
++            if m:
++                discovered_numbers.append(int(m.group(1)))
++    if len(discovered_numbers) == 0 and os.path.isdir(render_dir_candidate):
++        for fname in os.listdir(render_dir_candidate):
++            m = re.match(r"^r_(\d+)\.png$", fname)
++            if m:
++                discovered_numbers.append(int(m.group(1)))
++        if len(discovered_numbers) > 0:
++            use_render_dir = True
++
++    discovered_numbers = sorted(set(discovered_numbers))
++    # Optional filtering by specific ids
++    requested_ids = None
++    if cfg.get("inference_ids", None) is not None:
++        ids_cfg = cfg.get("inference_ids")
++        if isinstance(ids_cfg, (list, omegaconf.listconfig.ListConfig)):
++            try:
++                requested_ids = [int(x) for x in list(ids_cfg)]
++            except Exception:
++                requested_ids = None
++        elif isinstance(ids_cfg, str):
++            try:
++                requested_ids = [int(x.strip()) for x in ids_cfg.split(",") if x.strip() != ""]
++            except Exception:
++                requested_ids = None
++    if requested_ids is not None:
++        discovered_numbers = [n for n in discovered_numbers if n in set(requested_ids)]
++
++    if len(discovered_numbers) == 0:
++        print(f"No input frames discovered. Expected either '{rgb_dir_candidate}/r_<n>_rgb.png' or '{render_dir_candidate}/r_<n>.png'.")
++        return
++    else:
++        print(f"Discovered {len(discovered_numbers)} frames from {'render' if use_render_dir else 'rgb'} directory.")
++
++    # Prepare index mapping and stride grouping
++    num_to_index = {n: i for i, n in enumerate(discovered_numbers)}
++    total_frames = len(discovered_numbers)
++    window_stride = inference_n_frames
++
++    # Build the processing list as non-overlapping windows of size inference_n_frames
++    validation_video_list = []
++    num_groups = max(1, (total_frames + inference_n_frames - 1) // inference_n_frames)
++    for g in range(num_groups):
++        validation_video_list.append([f"r_{g}"])
+ 
+     inference_save_dir = cfg.inference_save_dir
+     os.makedirs(inference_save_dir, exist_ok=True)
++    os.makedirs(os.path.join(inference_save_dir, "predictions"), exist_ok=True)
++    os.makedirs(os.path.join(inference_save_dir, "env_bg"), exist_ok=True)
+ 
+     success_signal_dir = os.path.join(inference_save_dir, "TMP_SUCCESS_SIGNAL")
+     if os.path.exists(success_signal_dir):  # check and filter finished videos
+         filtered_validation_video_list = []
+         for input_image_relative_path_list in validation_video_list:
+-            video_relative_base_name = base_plus_ext(input_image_relative_path_list[0], mode=image_group_mode)[0]
+-            success_signal_str = video_relative_base_name.replace("/", "--")
++            identifier = input_image_relative_path_list[0]  # This will be something like "r_0", "r_1", etc.
++            success_signal_str = identifier.replace("/", "--")
+             success_signal_path = os.path.join(success_signal_dir, success_signal_str)
+             if os.path.exists(success_signal_path):
+-                print(f"Skipping video: {success_signal_str}")
++                print(f"Skipping: {success_signal_str}")
+             else:
+                 filtered_validation_video_list.append(input_image_relative_path_list)
+ 
+@@ -183,45 +269,148 @@ def main():
+ 
+     with distributed_state.split_between_processes(validation_video_list) as validation_video_list:
+         for i, input_image_relative_path_list in enumerate(
+-                tqdm(validation_video_list, desc="processing videos (image sequences): ")
++                tqdm(validation_video_list, desc="processing images: ")
+         ):
+-            # check processed signal
+-            video_relative_base_name = base_plus_ext(input_image_relative_path_list[0], mode=image_group_mode)[0]
+-            success_signal_str = video_relative_base_name.replace("/", "--")
++            # Get the current identifier
++            identifier = input_image_relative_path_list[0]  # This will be something like "r_0", "r_1", etc.
++            success_signal_str = identifier.replace("/", "--")
+             success_signal_path = os.path.join(success_signal_dir, success_signal_str)
+             if os.path.exists(success_signal_path):
+-                print(f"Skipping chunk: {success_signal_str}")
++                print(f"Skipping: {success_signal_str}")
+                 continue
+ 
+-            if cfg.get('save_image', False) or cfg.get('save_video', False):
+-                save_dir = os.path.join(inference_save_dir, os.path.dirname(video_relative_base_name))
+-                os.makedirs(save_dir, exist_ok=True)
++            # Get the starting number for this chunk and compute per-frame numbers
++            number = identifier.split('_')[1]  # starting number as string
++            start_num = int(number)
++            base_name = identifier.split('_')[0]  # Extract "r"
++
++            # Build the list of frame numbers for this group: overlapping 20-frame window with stride 10
++            k_numbers = []
++            try:
++                group_idx = int(number)
++            except Exception:
++                group_idx = 0
++
++            start = group_idx * window_stride
++            end = start + (inference_n_frames - 1)
++            # Clamp end to max available number while keeping window length by padding later
++            last_appended = discovered_numbers[0]
++            for n in range(start, end + 1):
++                if n in num_to_index:
++                    k_numbers.append(n)
++                    last_appended = n
++                else:
++                    k_numbers.append(last_appended)
++
++            # Determine RGB source path for this number
++            if 'use_render_dir' not in locals():
++                rgb_dir_candidate = os.path.join(cfg.inference_input_dir, "rgb")
++                render_dir_candidate = os.path.join(cfg.inference_input_dir, "render")
++                use_render_dir = os.path.isdir(render_dir_candidate) and not os.path.exists(os.path.join(rgb_dir_candidate, f"r_{number}_rgb.png"))
++            if use_render_dir:
++                rgb_single_path = os.path.join(render_dir_candidate, f"r_{number}.png")
++            else:
++                rgb_single_path = os.path.join(rgb_dir_candidate, f"r_{number}_rgb.png")
++
++            # Optional external gbuffer eval root (e.g., .../eval/{base_color,normal,roughness,metallic,depth}/r_{n}.png)
++            external_eval_root = cfg.get('external_gbuffer_eval_root', None)
++            if external_eval_root is not None:
++                print(f"Using external_gbuffer_eval_root: {external_eval_root}")
++            external_folder_map = {
++                'basecolor': 'base_color',
++                'normal': 'normal',
++                'roughness': 'roughness',
++                'metallic': 'metallic',
++                'depth': 'depth',
++                'diffuse_albedo': 'diffuse_albedo',
++            }
+ 
+             # Formatting input
+-            # - cond_images:
+-            #       A dictionary of images to condition on. The keys are the names of the conditions and the values are
+-            #       the images. NOTE: The images should be in the range [0, 1]
+-            #       If np.array: BFHWC
+-            #       If torch.tensor: BFCHW
+-            # For example:
+-            #   basecolor: (1, 24, 512, 768, 3)
+-            #   normal: (1, 24, 512, 768, 3)
+-            #   depth: (1, 24, 512, 768, 3)
+-            #   roughness: (1, 24, 512, 768, 3)
+-            #   metallic: (1, 24, 512, 768, 3)
+-            #   env_ldr: (1, 24, 512, 512, 3)
+-            #   env_log: (1, 24, 512, 512, 3)
+-            #   env_nrm: (1, 24, 512, 512, 3)
+             cond_images = {}
+             for gbuf_label in cond_gbuf_labels:
+                 gbuf_path_list = []
+-                for x in input_image_relative_path_list:
+-                    if f".{gbuf_label}." in x:
+-                        gbuf_path_list.append(x)
++                
++                # Build a per-frame path list for this modality starting at current number
++                for offset in range(inference_n_frames):
++                    k = k_numbers[offset] # Use k_numbers here
++                    img_path_k = None
++
++                    if gbuf_label == "rgb":
++                        # Determine per-frame RGB path
++                        if use_render_dir:
++                            rgb_k_path = os.path.join(render_dir_candidate, f"r_{k}.png")
++                        else:
++                            rgb_k_path = os.path.join(rgb_dir_candidate, f"r_{k}_rgb.png")
++                        if os.path.exists(rgb_k_path):
++                            img_path_k = rgb_k_path
++                    else:
++                        # Prefer external eval root if provided and path exists
++                        if external_eval_root is not None and gbuf_label in external_folder_map:
++                            ext_dir = os.path.join(external_eval_root, external_folder_map[gbuf_label])
++                            ext_candidate = os.path.join(ext_dir, f"r_{k}.png")
++                            if os.path.exists(ext_candidate):
++                                img_path_k = ext_candidate
++                        # Fallback to default project input layout if not found
++                        if img_path_k is None:
++                            candidate_folders = [os.path.join(cfg.inference_input_dir, gbuf_label)]
++                            if gbuf_label in external_folder_map:
++                                candidate_folders.append(os.path.join(cfg.inference_input_dir, external_folder_map[gbuf_label]))
++                            candidate_filenames = [f"{base_name}_{k}_{gbuf_label}.png", f"r_{k}.png"]
++                            for folder in candidate_folders:
++                                for fname in candidate_filenames:
++                                    cand = os.path.join(folder, fname)
++                                    if os.path.exists(cand):
++                                        img_path_k = cand
++                                        break
++                                if img_path_k is not None:
++                                    break
++                        # Fallback: use RGB image if the specific modality is missing
++                        if img_path_k is None and os.path.exists(os.path.join(rgb_dir_candidate, f"r_{k}_rgb.png")):
++                            img_path_k = os.path.join(rgb_dir_candidate, f"r_{k}_rgb.png")
++                        if img_path_k is None and os.path.exists(os.path.join(render_dir_candidate, f"r_{k}.png")):
++                            img_path_k = os.path.join(render_dir_candidate, f"r_{k}.png")
++
++                    if img_path_k is not None and os.path.exists(img_path_k):
++                        gbuf_path_list.append(img_path_k)
++                    else:
++                        # If missing, repeat last available frame path to keep sequence length
++                        if len(gbuf_path_list) > 0:
++                            gbuf_path_list.append(gbuf_path_list[-1])
++                        else:
++                            # As a last resort, try the current-number single path patterns
++                            if gbuf_label == "rgb":
++                                fallback = rgb_single_path
++                            else:
++                                fallback = None
++                                # Check the current-number candidates
++                                if external_eval_root is not None and gbuf_label in external_folder_map:
++                                    ext_dir = os.path.join(external_eval_root, external_folder_map[gbuf_label])
++                                    cand0 = os.path.join(ext_dir, f"r_{number}.png")
++                                    if os.path.exists(cand0):
++                                        fallback = cand0
++                                if fallback is None:
++                                    candidate_folders = [os.path.join(cfg.inference_input_dir, gbuf_label)]
++                                    if gbuf_label in external_folder_map:
++                                        candidate_folders.append(os.path.join(cfg.inference_input_dir, external_folder_map[gbuf_label]))
++                                    candidate_filenames = [f"{base_name}_{number}_{gbuf_label}.png", f"r_{number}.png"]
++                                    for folder in candidate_folders:
++                                        for fname in candidate_filenames:
++                                            cand = os.path.join(folder, fname)
++                                            if os.path.exists(cand):
++                                                fallback = cand
++                                                break
++                                        if fallback is not None:
++                                            break
++                            if fallback is not None and os.path.exists(fallback):
++                                gbuf_path_list.append(fallback)
++                
++                if not gbuf_path_list:
++                    print(f"Error: No images found for modality {gbuf_label}")
++                    continue
+ 
+                 gbuf_list = []
+                 for ind in range(inference_n_frames):
+-                    input_path = os.path.join(cfg.inference_input_dir, gbuf_path_list[ind])
++                    input_path = gbuf_path_list[ind % len(gbuf_path_list)]  # Support single-image (tiled) or multi-frame lists
+                     input_image_pil = Image.open(input_path)
+                     input_image_pil = convert_rgba_to_rgb_pil(input_image_pil, background_color=(0, 0, 0))
+ 
+@@ -251,14 +440,31 @@ def main():
+                     envlight_path,
+                     resolution=env_resolution,
+                     num_frames=inference_n_frames,
+-                    fixed_pose=True,
++                    fixed_pose=False,
++                    pose_file=cfg.get('pose_file', None),
++                    pose_offset=cfg.get('pose_offset', 0),
++                    pose_reset=cfg.get('pose_reset', False),
+                     rotate_envlight=cfg.rotate_light,
+                     elevation=cfg.get('cam_elevation', 0),
++                    env_rot=cfg.get('env_rot', 180.0),
++                    env_flip=cfg.get('env_flip', False),
++                    env_strength=cfg.get('env_strength', 1.0),
+                     env_format=['proj', 'fixed', 'ball'],
+                     device=distributed_state.device,
++                    save_dir=os.path.join(cfg.inference_save_dir, "envmap_debug"),
++                    prefix=f"r_{number}",
++                    frame_indices=k_numbers if 'k_numbers' in locals() else None,
++                    env_total_frames=len(discovered_numbers),
+                 )
+-                cond_images['env_ldr'] = envlight_dict['env_ldr'].unsqueeze(0).permute(0, 1, 4, 2, 3)
+-                cond_images['env_log'] = envlight_dict['env_log'].unsqueeze(0).permute(0, 1, 4, 2, 3)
++
++                env_ldr = envlight_dict['env_ldr']
++                env_log = envlight_dict['env_log']
++                if env_ldr.shape[-1] > 3:
++                    env_ldr = env_ldr[..., :3]
++                if env_log.shape[-1] > 3:
++                    env_log = env_log[..., :3]
++                cond_images['env_ldr'] = env_ldr.unsqueeze(0).permute(0, 1, 4, 2, 3)
++                cond_images['env_log'] = env_log.unsqueeze(0).permute(0, 1, 4, 2, 3)
+                 env_nrm = envmap_vec(env_resolution, device=distributed_state.device) * 0.5 + 0.5
+                 cond_images['env_nrm'] = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 1, 4, 2, 3).expand_as(cond_images['env_ldr'])
+ 
+@@ -294,8 +500,24 @@ def main():
+                 # Save images locally
+                 if cfg.get('save_image', False):
+                     for ind in range(len(inference_image_list)):
+-                        save_path = os.path.join(inference_save_dir, f"{video_relative_base_name}.{ind:04d}.env{envlight_ind:04d}.png")
+-                        inference_image_list[ind].save(save_path)
++                        # Get the environment map for this frame
++                        env_ldr_frame = envlight_dict['env_ldr'][ind]  # [H, W, 3]
++                        knum = k_numbers[ind] if 'k_numbers' in locals() else int(number) + ind
++                        
++                        # Save AI prediction (per-frame)
++                        save_path_pred = os.path.join(inference_save_dir, "predictions", f"r_{knum}_pred.png")
++                        inference_image_list[ind].save(save_path_pred)
++                        print(f"Saved prediction: {save_path_pred}")
++                        
++                        # Save environment background (per-frame)
++                        if cfg.get('save_env_background', True):
++                            env_background = render_environment_background(
++                                env_ldr_frame, 
++                                target_size=(inference_image_list[ind].width, inference_image_list[ind].height)
++                            )
++                            save_path_env = os.path.join(inference_save_dir, "env_bg", f"r_{knum}_env_bg.png")
++                            env_background.save(save_path_env)
++                            print(f"Saved environment background: {save_path_env}")
+ 
+                 if cfg.get('save_video', False):
+                     if len(viz_images_uint8) == 0:
+@@ -309,7 +531,7 @@ def main():
+ 
+             # Visualize results as video
+             if cfg.get('save_video', False):
+-                save_path = os.path.join(inference_save_dir, f"{video_relative_base_name}.viz.mp4")
++                save_path = os.path.join(inference_save_dir, f"{identifier}.viz.mp4")
+                 imageio.mimsave(save_path, viz_images_uint8, fps=cfg.get('save_video_fps', 7), codec='h264')
+ 
+             # Mark the inference is finished
+diff --git a/utils/utils_env_proj.py b/utils/utils_env_proj.py
+index 212b0d3..cb5438f 100644
+--- a/utils/utils_env_proj.py
++++ b/utils/utils_env_proj.py
+@@ -51,6 +51,8 @@ def process_environment_map(
+     save_dir=None,
+     prefix='0000',
+     device=None,
++    frame_indices=None,
++    env_total_frames=None,
+ ):
+     """
+     Preprocess HDR environment maps for rendering.
+@@ -97,10 +99,18 @@ def process_environment_map(
+         pose_offset=pose_offset,
+         pose_reset=pose_reset,
+         elevation=elevation / 180 * np.pi,
++        frame_indices=frame_indices,
+     )
+ 
+-    # Prepare rotations for the environment light
+-    rots = np.linspace(0, 2 * np.pi, num_frames) if rotate_envlight else [0] * num_frames
++    # Prepare rotations for the environment light (global if indices provided)
++    if rotate_envlight:
++        if frame_indices is not None and env_total_frames not in (None, 0):
++            fi = np.array(frame_indices, dtype=float)
++            rots = (fi / float(env_total_frames)) * (2 * np.pi)
++        else:
++            rots = np.linspace(0, 2 * np.pi, num_frames)
++    else:
++        rots = [0] * num_frames
+ 
+     # Load and preprocess the HDR environment map
+     cubemap = load_and_preprocess_hdr(
+@@ -161,7 +171,9 @@ def process_environment_map(
+     for i in range(num_frames):
+         frame_prefix = f'{prefix}.{i:04d}'
+         c2w = torch.from_numpy(poses[i]).float().to(device)
+-        y_rot = util.rotate_y(rots[i], device=device)
++        R_b2r = util.rotate_x(np.pi/2, device=device)
++        c2w = R_b2r @ c2w
++        y_rot = util.rotate_y(rots[i], device=device) if isinstance(rots, (list, np.ndarray)) else util.rotate_y(rots, device=device)
+ 
+         if 'proj' in env_format:
+             env_proj = process_projected_envmap(cubemap, vec, c2w, y_rot, H, W)
+@@ -195,17 +207,32 @@ def process_environment_map(
+     return results
+ 
+ 
+-def prepare_camera_poses(num_frames, fixed_pose, pose_file, pose_offset, pose_reset, elevation=0):
++def prepare_camera_poses(num_frames, fixed_pose, pose_file, pose_offset, pose_reset, elevation=0, frame_indices=None):
+     """Prepare camera poses based on the provided arguments."""
+     if fixed_pose or pose_file is None:
+         return [util.get_cam_matrix(np.pi/2, elevation).numpy() for _ in range(num_frames)]
+ 
+     with open(pose_file, 'r') as f:
+         meta = json.load(f)
+-    frames = meta['frames'][pose_offset:pose_offset + num_frames]
++
++    all_frames = meta['frames']
++    if frame_indices is not None:
++        selected = []
++        for i in frame_indices:
++            j = pose_offset + int(i)
++            if 0 <= j < len(all_frames):
++                selected.append(all_frames[j])
++            else:
++                # clamp to valid range if out of bounds
++                j = min(max(j, 0), len(all_frames) - 1)
++                selected.append(all_frames[j])
++        frames = selected
++    else:
++        frames = all_frames[pose_offset:pose_offset + num_frames]
++
+     c2w_list = [np.array(frame['transform_matrix']) for frame in frames]
+ 
+-    if pose_reset:
++    if pose_reset and len(c2w_list) > 0:
+         w2c_0 = np.linalg.inv(c2w_list[0])
+         c2w_list = [w2c_0 @ c2w_i for c2w_i in c2w_list]
+ 
+@@ -338,7 +365,7 @@ if __name__ == '__main__':
+         parser.add_argument('--env_strength', type=float, default=1.0, help="Strength multiplier for the environment map.")
+ 
+         parser.add_argument('--env_format', nargs='+', type=str, default=['proj', 'fixed', 'ball'],
+-                            choices=['proj', 'fixed', 'ball'], help="Formats of the environment maps to generate.")
++                        choices=['proj', 'fixed', 'ball'], help="Formats of the environment maps to generate.")
+         parser.add_argument('--log_scale', type=float, default=10000, help="Log scale factor for HDR mapping.")
+ 
+         return parser.parse_args()
+diff --git a/utils/utils_rgbx_inference.py b/utils/utils_rgbx_inference.py
+index a86727c..6355e1a 100644
+--- a/utils/utils_rgbx_inference.py
++++ b/utils/utils_rgbx_inference.py
+@@ -61,6 +61,14 @@ def base_plus_ext(path, mode="folder"):
+     raise NotImplementedError
+ 
+ 
++def _natural_sort_key(path_str: str):
++    """Return a key for natural sorting of paths with numbers (e.g., 1,2,10)."""
++    s = os.fspath(path_str)
++    # Only consider the filename component for ordering within a folder
++    filename = os.path.basename(s)
++    return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", filename)]
++
++
+ def group_images_into_videos(validation_image_paths, image_group_mode="folder", subsample_every_n_frames=1):
+     validation_videos = defaultdict(list)
+     for image_path in validation_image_paths:
+@@ -70,7 +78,9 @@ def group_images_into_videos(validation_image_paths, image_group_mode="folder",
+ 
+     validation_video_list = []
+     for key in validation_videos:
+-        validation_video_list.append(sorted(validation_videos[key])[::subsample_every_n_frames])
++        # Natural sort so frames like 1,2,3,...,10 instead of 1,10,11,...,2
++        sorted_paths = sorted(validation_videos[key], key=_natural_sort_key)
++        validation_video_list.append(sorted_paths[::subsample_every_n_frames])
+ 
+     return validation_video_list
+ 

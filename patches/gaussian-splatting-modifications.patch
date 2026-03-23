@@ -1,0 +1,183 @@
+diff --git a/gaussian_renderer/__init__.py b/gaussian_renderer/__init__.py
+index e12f4b6..f861610 100644
+--- a/gaussian_renderer/__init__.py
++++ b/gaussian_renderer/__init__.py
+@@ -33,21 +33,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+ 
+-    raster_settings = GaussianRasterizationSettings(
+-        image_height=int(viewpoint_camera.image_height),
+-        image_width=int(viewpoint_camera.image_width),
+-        tanfovx=tanfovx,
+-        tanfovy=tanfovy,
+-        bg=bg_color,
+-        scale_modifier=scaling_modifier,
+-        viewmatrix=viewpoint_camera.world_view_transform,
+-        projmatrix=viewpoint_camera.full_proj_transform,
+-        sh_degree=pc.active_sh_degree,
+-        campos=viewpoint_camera.camera_center,
+-        prefiltered=False,
+-        debug=pipe.debug,
+-        antialiasing=pipe.antialiasing
+-    )
++    # Build kwargs to gracefully handle differing rasterizer APIs across versions
++    raster_settings_kwargs = {
++        'image_height': int(viewpoint_camera.image_height),
++        'image_width': int(viewpoint_camera.image_width),
++        'tanfovx': tanfovx,
++        'tanfovy': tanfovy,
++        'bg': bg_color,
++        'scale_modifier': scaling_modifier,
++        'viewmatrix': viewpoint_camera.world_view_transform,
++        'projmatrix': viewpoint_camera.full_proj_transform,
++        'sh_degree': pc.active_sh_degree,
++        'campos': viewpoint_camera.camera_center,
++        'prefiltered': False,
++        'debug': pipe.debug,
++    }
++    # Only add antialiasing if present in pipeline params
++    if hasattr(pipe, 'antialiasing'):
++        raster_settings_kwargs['antialiasing'] = pipe.antialiasing
++
++    try:
++        raster_settings = GaussianRasterizationSettings(**raster_settings_kwargs)
++    except TypeError:
++        # Remove potentially unsupported kwargs and retry
++        raster_settings_kwargs.pop('antialiasing', None)
++        try:
++            raster_settings = GaussianRasterizationSettings(**raster_settings_kwargs)
++        except TypeError:
++            raster_settings_kwargs.pop('debug', None)
++            raster_settings = GaussianRasterizationSettings(**raster_settings_kwargs)
+ 
+     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+ 
+@@ -88,7 +102,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+ 
+     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+     if separate_sh:
+-        rendered_image, radii, depth_image = rasterizer(
++        raster_out = rasterizer(
+             means3D = means3D,
+             means2D = means2D,
+             dc = dc,
+@@ -99,7 +113,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+             rotations = rotations,
+             cov3D_precomp = cov3D_precomp)
+     else:
+-        rendered_image, radii, depth_image = rasterizer(
++        raster_out = rasterizer(
+             means3D = means3D,
+             means2D = means2D,
+             shs = shs,
+@@ -108,7 +122,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+             scales = scales,
+             rotations = rotations,
+             cov3D_precomp = cov3D_precomp)
+-        
++
++    # Support rasterizers returning either (image, radii, depth) or (image, radii)
++    if isinstance(raster_out, tuple):
++        if len(raster_out) == 3:
++            rendered_image, radii, depth_image = raster_out
++        elif len(raster_out) == 2:
++            rendered_image, radii = raster_out
++            depth_image = None
++        else:
++            # Unexpected signature; best effort: first is image, second is radii
++            rendered_image = raster_out[0]
++            radii = raster_out[1] if len(raster_out) > 1 else torch.zeros_like(rendered_image[0, :, :])
++            depth_image = None
++    else:
++        # If some versions return an object, try to access attributes
++        rendered_image = getattr(raster_out, 'image', None)
++        radii = getattr(raster_out, 'radii', None)
++        depth_image = getattr(raster_out, 'depth', None)
++        if rendered_image is None or radii is None:
++            raise ValueError("Unexpected rasterizer return type; cannot extract image and radii")
++
++    
+     # Apply exposure to rendered image (training only)
+     if use_trained_exp:
+         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 8091614..af8ad74 100644
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -13,7 +13,8 @@ import os
+ import random
+ import json
+ from utils.system_utils import searchForMaxIteration
+-from scene.dataset_readers import sceneLoadTypeCallbacks
++from scene.dataset_readers import sceneLoadTypeCallbacks, storePly
++import numpy as np
+ from scene.gaussian_model import GaussianModel
+ from arguments import ModelParams
+ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+@@ -49,8 +50,17 @@ class Scene:
+             assert False, "Could not recognize scene type!"
+ 
+         if not self.loaded_iter:
+-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+-                dest_file.write(src_file.read())
++            input_ply_path = os.path.join(self.model_path, "input.ply")
++            try:
++                with open(scene_info.ply_path, 'rb') as src_file, open(input_ply_path , 'wb') as dest_file:
++                    dest_file.write(src_file.read())
++            except FileNotFoundError:
++                # Fallback: if source PLY is missing (e.g., Blender dataset without a preexisting PLY),
++                # create an input.ply in the model directory from the in-memory point cloud.
++                if scene_info.point_cloud is not None:
++                    xyz = np.asarray(scene_info.point_cloud.points)
++                    rgb = np.clip(np.asarray(scene_info.point_cloud.colors) * 255.0, 0, 255).astype(np.uint8)
++                    storePly(input_ply_path, xyz, rgb)
+             json_cams = []
+             camlist = []
+             if scene_info.test_cameras:
+diff --git a/scene/cameras.py b/scene/cameras.py
+index 63161b9..5256426 100644
+--- a/scene/cameras.py
++++ b/scene/cameras.py
+@@ -31,6 +31,8 @@ class Camera(nn.Module):
+         self.FoVx = FoVx
+         self.FoVy = FoVy
+         self.image_name = image_name
++        # Original file path if available on the PIL image object
++        self.image_path = getattr(image, "filename", None)
+ 
+         try:
+             self.data_device = torch.device(data_device)
+diff --git a/train.py b/train.py
+index 8206903..9c8f4c5 100644
+--- a/train.py
++++ b/train.py
+@@ -111,17 +111,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+ 
+-        if viewpoint_cam.alpha_mask is not None:
+-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
+-            image *= alpha_mask
++        # Do not mask the rendered image; instead, build a masked GT target below
+ 
+-        # Loss
++        # Loss: compare rendered image to GT composited with background using alpha mask
+         gt_image = viewpoint_cam.original_image.cuda()
+-        Ll1 = l1_loss(image, gt_image)
++        if viewpoint_cam.alpha_mask is not None:
++            alpha_mask = viewpoint_cam.alpha_mask.cuda()
++            bg_img = bg.view(3, 1, 1).expand_as(gt_image)
++            gt_target = gt_image * alpha_mask + bg_img * (1.0 - alpha_mask)
++        else:
++            gt_target = gt_image
++        Ll1 = l1_loss(image, gt_target)
+         if FUSED_SSIM_AVAILABLE:
+-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
++            ssim_value = fused_ssim(image.unsqueeze(0), gt_target.unsqueeze(0))
+         else:
+-            ssim_value = ssim(image, gt_image)
++            ssim_value = ssim(image, gt_target)
+ 
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+ 
